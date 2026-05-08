@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pager</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      background: #0a0a0a;
+      color: #e6e6e6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+    }
+    h1 {
+      margin: 0;
+      font-weight: 300;
+      letter-spacing: 0.4em;
+      font-size: 2rem;
+    }
+    button {
+      background: #1a1a1a;
+      color: #e6e6e6;
+      border: 1px solid #333;
+      padding: 0.8rem 2.5rem;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 0.9rem;
+      letter-spacing: 0.15em;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button:hover:not(:disabled) { background: #222; border-color: #555; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .status {
+      margin: 0;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 0.75rem;
+      color: #666;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      min-height: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>PAGER</h1>
+  <button id="talk">TALK</button>
+  <p class="status" id="status">disconnected</p>
+
+  <script type="module">
+    import { Conversation } from "https://esm.sh/@elevenlabs/client@latest";
+
+    const button = document.getElementById("talk");
+    const statusEl = document.getElementById("status");
+    let conversation = null;
+
+    function setStatus(text) { statusEl.textContent = text; }
+
+    button.addEventListener("click", async () => {
+      if (conversation) {
+        await conversation.endSession();
+        return;
+      }
+
+      button.disabled = true;
+      setStatus("requesting mic...");
+
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        setStatus("mic denied");
+        button.disabled = false;
+        return;
+      }
+
+      setStatus("fetching signed url...");
+      let signedUrl;
+      try {
+        const res = await fetch("/api/signed-url");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        ({ signedUrl } = await res.json());
+      } catch (err) {
+        setStatus("signed-url failed: " + err.message);
+        button.disabled = false;
+        return;
+      }
+
+      setStatus("connecting...");
+      try {
+        conversation = await Conversation.startSession({
+          signedUrl,
+          clientTools: {
+            run_shell: async ({ command }) => {
+              console.log("[tool] run_shell", command);
+              const r = await fetch("/api/run_shell", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ command }),
+              });
+              const data = await r.json();
+              return JSON.stringify(data);
+            },
+            claude_code: async ({ prompt }) => {
+              console.log("[tool] claude_code", prompt);
+              const r = await fetch("/api/claude_code", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt }),
+              });
+              const data = await r.json();
+              return JSON.stringify(data);
+            },
+          },
+          onConnect: () => {
+            setStatus("listening");
+            button.textContent = "STOP";
+            button.disabled = false;
+          },
+          onDisconnect: () => {
+            setStatus("disconnected");
+            button.textContent = "TALK";
+            button.disabled = false;
+            conversation = null;
+          },
+          onError: (e) => {
+            console.error("convai error", e);
+            setStatus("error: " + (e?.message ?? e));
+          },
+          onModeChange: ({ mode }) => {
+            // mode is "speaking" | "listening"
+            setStatus(mode);
+          },
+        });
+      } catch (err) {
+        console.error(err);
+        setStatus("connect failed: " + err.message);
+        button.disabled = false;
+        conversation = null;
+      }
+    });
+  </script>
+</body>
+</html>
