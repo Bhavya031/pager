@@ -14,6 +14,9 @@ if (!API_KEY) {
 const PORT = 3030;
 const REPO_DIR = import.meta.dir;
 const TOOL_TIMEOUT_MS = 30_000;
+// Agent subprocesses (cursor-agent, claude -p) can run multi-step reasoning;
+// give them more headroom than a plain shell command.
+const AGENT_TIMEOUT_MS = 60_000;
 
 async function getSignedUrl(): Promise<string> {
   const res = await fetch(
@@ -29,7 +32,11 @@ async function getSignedUrl(): Promise<string> {
 
 type SpawnResult = { stdout: string; stderr: string; exit_code: number; timed_out: boolean };
 
-async function runWithTimeout(cmd: string[], cwd: string): Promise<SpawnResult> {
+async function runWithTimeout(
+  cmd: string[],
+  cwd: string,
+  timeoutMs: number = TOOL_TIMEOUT_MS,
+): Promise<SpawnResult> {
   const proc = Bun.spawn(cmd, {
     cwd,
     stdout: "pipe",
@@ -37,7 +44,7 @@ async function runWithTimeout(cmd: string[], cwd: string): Promise<SpawnResult> 
   });
 
   const timeout = new Promise<"timeout">((resolve) =>
-    setTimeout(() => resolve("timeout"), TOOL_TIMEOUT_MS),
+    setTimeout(() => resolve("timeout"), timeoutMs),
   );
 
   const finish = (async () => {
@@ -51,7 +58,7 @@ async function runWithTimeout(cmd: string[], cwd: string): Promise<SpawnResult> 
     proc.kill();
     return {
       stdout: "",
-      stderr: `Command timed out after ${TOOL_TIMEOUT_MS / 1000}s`,
+      stderr: `Command timed out after ${timeoutMs / 1000}s`,
       exit_code: -1,
       timed_out: true,
     };
@@ -109,7 +116,26 @@ Bun.serve({
           return Response.json({ error: "missing 'prompt'" }, { status: 400 });
         }
         console.log(`[claude_code] ${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}`);
-        const result = await runWithTimeout(["claude", "-p", prompt], REPO_DIR);
+        const result = await runWithTimeout(["claude", "-p", prompt], REPO_DIR, AGENT_TIMEOUT_MS);
+        return Response.json(result);
+      } catch (err) {
+        console.error(err);
+        return Response.json({ error: String(err) }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/api/cursor_agent" && req.method === "POST") {
+      try {
+        const { prompt } = (await req.json()) as { prompt: string };
+        if (!prompt || typeof prompt !== "string") {
+          return Response.json({ error: "missing 'prompt'" }, { status: 400 });
+        }
+        console.log(`[cursor_agent] ${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}`);
+        const result = await runWithTimeout(
+          ["cursor-agent", "-p", "--trust", "--force", prompt],
+          REPO_DIR,
+          AGENT_TIMEOUT_MS,
+        );
         return Response.json(result);
       } catch (err) {
         console.error(err);

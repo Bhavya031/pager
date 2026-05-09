@@ -116,6 +116,16 @@
               const data = await r.json();
               return JSON.stringify(data);
             },
+            cursor_agent: async ({ prompt }) => {
+              console.log("[tool] cursor_agent", prompt);
+              const r = await fetch("/api/cursor_agent", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt }),
+              });
+              const data = await r.json();
+              return JSON.stringify(data);
+            },
           },
           onConnect: () => {
             setStatus("listening");
