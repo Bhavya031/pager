@@ -143,6 +143,14 @@ Bun.serve({
       }
     }
 
+    // static fallback: serve anything under public/ (pager.png, future assets)
+    if (req.method === "GET" && !url.pathname.startsWith("/api/") && !url.pathname.includes("..")) {
+      const file = Bun.file(`./public${url.pathname}`);
+      if (await file.exists()) {
+        return new Response(file);
+      }
+    }
+
     return new Response("Not found", { status: 404 });
   },
 });

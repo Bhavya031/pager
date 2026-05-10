@@ -5,93 +5,435 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Pager</title>
   <style>
-    :root { color-scheme: dark; }
-    html, body { margin: 0; padding: 0; height: 100%; }
+    :root {
+      color-scheme: light;
+      --bg: #f7f2eb;
+      --screen-bg: #3a3830;        /* dark olive LCD glass */
+      --dot-color: 244, 232, 192;  /* warm cream LCD pixel; opacity drives brightness */
+      --ink: #2a2622;
+      --ink-soft: #6b6258;
+
+      /* screen rectangle as % of pager image (1254x1254) — nudge by eye */
+      --screen-x: 17.5%;
+      --screen-y: 15.5%;
+      --screen-w: 65%;
+      --screen-h: 47%;
+      --screen-radius: 4%;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      height: 100%;
+      overflow: hidden;
+    }
     body {
-      background: #0a0a0a;
-      color: #e6e6e6;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      /* three-row grid: 1fr | pager | 1fr — pager is the true vertical anchor;
+         caption sits in the bottom 1fr, doesn't push the pager off-center. */
+      display: grid;
+      grid-template-rows: 1fr auto 1fr;
+      justify-items: center;
+      align-items: center;
+    }
+
+    .pager-wrap {
+      grid-row: 2;
+      position: relative;
+      width: min(30rem, 75vmin);
+      aspect-ratio: 1 / 1;
+      cursor: pointer;
+      transition: transform 0.2s ease;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .pager-wrap:hover { transform: translateY(-2px); }
+    .pager-wrap:active { transform: translateY(0); }
+
+    /* canvas sits BEHIND the pager image; the transparent screen reveals it.
+       background layers, top-most first:
+         1. SVG noise texture
+         2. Top-left LCD sheen (warm highlight)
+         3. Smooth radial vignette (transparent center → soft darkening
+            toward edges; corners get the most darkening because they're
+            geometrically farthest from center)
+         4. Solid khaki panel
+       box-shadow = thin soft "gap" line where bezel meets screen. */
+    .screen-canvas {
+      position: absolute;
+      left: var(--screen-x);
+      top: var(--screen-y);
+      width: var(--screen-w);
+      height: var(--screen-h);
+      background:
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.18 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>") repeat,
+        radial-gradient(ellipse 75% 55% at 32% 22%, rgba(255, 246, 222, 0.13), transparent 70%),
+        radial-gradient(ellipse at center, transparent 40%, rgba(0, 0, 0, 0.38) 105%),
+        var(--screen-bg);
+      border-radius: var(--screen-radius);
+      box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .pager-img {
+      position: relative;
+      width: 100%; height: 100%;
+      display: block;
+      pointer-events: none;
+      -webkit-user-drag: none;
+      z-index: 2;
+    }
+
+    .footer-stack {
+      grid-row: 3;
+      align-self: start;
+      margin-top: 1.5rem;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
-      gap: 1.5rem;
+      gap: 1rem;
     }
-    h1 {
+    .caption {
       margin: 0;
-      font-weight: 300;
-      letter-spacing: 0.4em;
-      font-size: 2rem;
-    }
-    button {
-      background: #1a1a1a;
-      color: #e6e6e6;
-      border: 1px solid #333;
-      padding: 0.8rem 2.5rem;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 0.9rem;
-      letter-spacing: 0.15em;
-      cursor: pointer;
-      border-radius: 4px;
-      transition: background 0.15s, border-color 0.15s;
-    }
-    button:hover:not(:disabled) { background: #222; border-color: #555; }
-    button:disabled { opacity: 0.4; cursor: not-allowed; }
-    .status {
-      margin: 0;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 0.75rem;
-      color: #666;
-      letter-spacing: 0.1em;
+      font-size: 0.78rem;
+      color: var(--ink-soft);
+      letter-spacing: 0.18em;
       text-transform: uppercase;
       min-height: 1rem;
+      transition: color 0.2s;
+    }
+    .viz-toggle {
+      display: inline-flex;
+      gap: 0.4rem;
+      padding: 0.25rem;
+      background: rgba(0, 0, 0, 0.04);
+      border-radius: 999px;
+    }
+    .viz-btn {
+      background: transparent;
+      border: none;
+      color: var(--ink-soft);
+      padding: 0.35rem 0.85rem;
+      font-family: inherit;
+      font-size: 0.65rem;
+      letter-spacing: 0.20em;
+      text-transform: uppercase;
+      cursor: pointer;
+      border-radius: 999px;
+      transition: background 0.18s, color 0.18s;
+    }
+    .viz-btn:hover { color: var(--ink); }
+    .viz-btn[data-active="true"] {
+      background: var(--ink);
+      color: var(--bg);
     }
   </style>
 </head>
 <body>
-  <h1>PAGER</h1>
-  <button id="talk">TALK</button>
-  <p class="status" id="status">disconnected</p>
+  <div class="pager-wrap" id="pager" role="button" aria-label="Tap the pager to talk">
+    <canvas class="screen-canvas" id="screen" width="320" height="160"></canvas>
+    <img src="/pager.png" alt="" class="pager-img" draggable="false" />
+  </div>
+  <div class="footer-stack">
+    <p class="caption" id="caption">Tap to talk</p>
+    <div class="viz-toggle" role="tablist" aria-label="Visualisation style">
+      <button type="button" class="viz-btn" data-viz="wave" data-active="true">Wave</button>
+      <button type="button" class="viz-btn" data-viz="cluster" data-active="false">Cluster</button>
+    </div>
+  </div>
 
   <script type="module">
     import { Conversation } from "https://esm.sh/@elevenlabs/client@latest";
 
-    const button = document.getElementById("talk");
-    const statusEl = document.getElementById("status");
+    const pagerEl = document.getElementById("pager");
+    const canvas = document.getElementById("screen");
+    const ctx = canvas.getContext("2d");
+    const captionEl = document.getElementById("caption");
+    const vizButtons = document.querySelectorAll(".viz-btn");
+
     let conversation = null;
+    let mode = "idle"; // idle | connecting | listening | speaking | error
+    let vizMode = "wave"; // wave | cluster — toggleable from UI
 
-    function setStatus(text) { statusEl.textContent = text; }
+    function setVizMode(next) {
+      vizMode = next;
+      for (const btn of vizButtons) {
+        btn.dataset.active = btn.dataset.viz === next ? "true" : "false";
+      }
+    }
+    vizButtons.forEach((btn) => {
+      btn.addEventListener("click", () => setVizMode(btn.dataset.viz));
+    });
 
-    button.addEventListener("click", async () => {
+    const COPY = {
+      idle:       "Tap to talk",
+      connecting: "Connecting…",
+      listening:  "Listening",
+      speaking:   "Speaking",
+      error:      "Error — tap to retry",
+    };
+    function setMode(next) {
+      mode = next;
+      captionEl.textContent = COPY[next] ?? COPY.idle;
+    }
+
+    // ── dot-matrix renderer (circular coin inside the screen rect) ──
+    // square LCD pixels filling the inscribed circle. each pixel sits
+    // somewhere on a dim→bright gradient. ~12% are flagged "inactive"
+    // so they stay at minimum intensity, punching organic holes in the
+    // bright cluster (vintage Nokia-LCD irregularity).
+    const COLS = 56;
+    const ROWS = 40;
+    // smoothed per-column amplitude, persisted across frames so the wave
+    // doesn't flicker. lerp toward the new amplitude each frame.
+    let SMOOTHED_AMP = new Float32Array(COLS);
+    const AMP_GAIN = 3.5;          // boost weak speech to visually-loud
+    const AMP_SMOOTH = 0.55;       // higher = smoother (more inertia)
+    const cs = getComputedStyle(document.documentElement);
+    const DOT_COLOR = cs.getPropertyValue("--dot-color").trim() || "244, 232, 192";
+    const DOT_RGB_TUPLE = DOT_COLOR.split(",").map((s) => parseInt(s.trim(), 10));
+
+    // deterministic per-dot data, all derived from one hash per cell so it's
+    // stable across resizes and frames. INACTIVE punches holes; BIN_OFFSET
+    // perturbs the freq-bin choice so the cluster isn't perfectly radial;
+    // PHASE is a per-dot phase offset so idle/connecting animations don't
+    // sync everywhere (gives a shimmer, not a unison pulse).
+    const INACTIVE = new Uint8Array(COLS * ROWS);
+    const BIN_OFFSET = new Float32Array(COLS * ROWS);
+    const PHASE = new Float32Array(COLS * ROWS);
+    for (let i = 0; i < INACTIVE.length; i++) {
+      const h = (i * 2654435761) >>> 0;
+      INACTIVE[i] = (h % 100) < 16 ? 1 : 0;
+      BIN_OFFSET[i] = ((h >>> 8) & 0xFFFF) / 65535; // 0..1
+      PHASE[i] = (((h >>> 16) & 0xFFFF) / 65535) * Math.PI * 2;
+    }
+
+    function resizeCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+    }
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+
+    let phase = 0;
+    function render() {
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      // pull audio data — wave mode wants time-domain samples (prefers
+      // real, falls back to volume-driven procedural); cluster mode wants
+      // frequency bins.
+      let waveData = null;
+      let freq = null;
+      let volume = 0;
+      const isActive = mode === "listening" || mode === "speaking";
+      if (conversation && isActive) {
+        const isOutput = mode === "speaking";
+        if (vizMode === "wave") {
+          try {
+            const td = isOutput
+              ? conversation.getOutputByteTimeDomainData
+              : conversation.getInputByteTimeDomainData;
+            if (typeof td === "function") waveData = td.call(conversation);
+          } catch {}
+          try {
+            const vol = isOutput ? conversation.getOutputVolume : conversation.getInputVolume;
+            if (typeof vol === "function") volume = vol.call(conversation) || 0;
+          } catch {}
+        } else {
+          // cluster mode: frequency-bin data for per-dot reactivity
+          try {
+            const fd = isOutput
+              ? conversation.getOutputByteFrequencyData
+              : conversation.getInputByteFrequencyData;
+            if (typeof fd === "function") freq = fd.call(conversation);
+          } catch {}
+        }
+      }
+
+      const cellW = w / COLS;
+      const cellH = h / ROWS;
+      const cell = Math.min(cellW, cellH);
+      const dotSize = cell * 0.62;     // square pixel; gap of ~38% between dots
+      const dotOffset = (cell - dotSize) / 2;
+
+      // glow once for the whole pass — colour stays cream, only blur flexes
+      ctx.shadowColor = `rgb(${DOT_RGB_TUPLE[0]}, ${DOT_RGB_TUPLE[1]}, ${DOT_RGB_TUPLE[2]})`;
+      ctx.shadowBlur = 0;
+
+      // precompute per-column amplitudes once per frame (was per cell).
+      // each column = MAX |sample| in its slice of the waveform buffer,
+      // boosted by AMP_GAIN, then frame-smoothed. only relevant for wave
+      // mode; cluster mode reads freq bins per-cell.
+      if (isActive && vizMode === "wave") {
+        const newAmps = new Float32Array(COLS);
+        if (waveData && waveData.length > 0) {
+          const samplesPerCol = waveData.length / COLS;
+          for (let cx = 0; cx < COLS; cx++) {
+            const lo = Math.floor(cx * samplesPerCol);
+            const hi = Math.min(waveData.length, Math.ceil((cx + 1) * samplesPerCol));
+            let peak = 0;
+            for (let i = lo; i < hi; i++) {
+              const v = Math.abs(waveData[i] - 128);
+              if (v > peak) peak = v;
+            }
+            newAmps[cx] = Math.min(1, (peak / 128) * AMP_GAIN);
+          }
+        } else {
+          // procedural fallback: 3 summed sines, amp = boosted volume
+          const t = phase * 1.4;
+          const amp = Math.max(0.20, volume * 2.5);
+          for (let cx = 0; cx < COLS; cx++) {
+            const xN = COLS > 1 ? cx / (COLS - 1) : 0.5;
+            const w =
+              Math.sin(xN * Math.PI * 5  + t)         * 0.50 +
+              Math.sin(xN * Math.PI * 11 - t * 1.3)   * 0.30 +
+              Math.sin(xN * Math.PI * 19 + t * 0.7)   * 0.20;
+            newAmps[cx] = Math.min(1, Math.abs(w) * amp);
+          }
+        }
+        for (let cx = 0; cx < COLS; cx++) {
+          SMOOTHED_AMP[cx] = SMOOTHED_AMP[cx] * AMP_SMOOTH + newAmps[cx] * (1 - AMP_SMOOTH);
+        }
+      } else {
+        // decay any held amplitudes when leaving active mode
+        for (let cx = 0; cx < COLS; cx++) SMOOTHED_AMP[cx] *= 0.85;
+      }
+
+      // circular coin: centered, radius = smaller of (w/2, h/2) * factor
+      const cxPx = w / 2;
+      const cyPx = h / 2;
+      const coinR = Math.min(w, h) * 0.38;
+
+      // grid center (in cell coords)
+      const cxCell = (COLS - 1) / 2;
+      const cyCell = (ROWS - 1) / 2;
+      const maxCellDist = Math.hypot(cxCell, cyCell);
+
+      phase += 0.05;
+
+      for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+          const px = (x + 0.5) * cellW;
+          const py = (y + 0.5) * cellH;
+
+          // skip cells outside the coin
+          const dxPx = px - cxPx;
+          const dyPx = py - cyPx;
+          if (dxPx * dxPx + dyPx * dyPx > coinR * coinR) continue;
+
+          const idx = y * COLS + x;
+          const inactive = INACTIVE[idx] === 1;
+
+          // distance in cell-space, normalized (0 center → 1 grid corner)
+          const dist = Math.hypot(x - cxCell, y - cyCell) / maxCellDist;
+          const centerBoost = Math.max(0, 1 - dist * 1.25);
+
+          let intensity;
+          if (inactive) {
+            // baseline cream pixel: barely visible, punches subtle holes
+            // in the wave line (vintage Nokia LCD irregularity)
+            intensity = 0.04;
+          } else if (isActive && vizMode === "wave") {
+            // ── filled, mirrored audio waveform through the coin ──
+            // amplitude already computed per-column above; tapered by an
+            // x envelope so the wave sits inside the coin naturally.
+            const xNorm = COLS > 1 ? x / (COLS - 1) : 0.5;
+            const xEnv = Math.sin(xNorm * Math.PI);
+            const fillHeight = SMOOTHED_AMP[x] * coinR * 1.0 * xEnv;
+            const distFromCenter = Math.abs(py - cyPx);
+
+            if (distFromCenter <= fillHeight) {
+              intensity = 0.82 + BIN_OFFSET[idx] * 0.18;
+            } else {
+              const edgeDist = distFromCenter - fillHeight;
+              const edgeFade = 1 - Math.min(1, edgeDist / (cellH * 1.8));
+              if (edgeFade > BIN_OFFSET[idx]) {
+                intensity = 0.18 + edgeFade * 0.45;
+              } else {
+                intensity = 0.05;
+              }
+            }
+          } else if (isActive && vizMode === "cluster") {
+            // ── radial bright cluster ──
+            // each dot picks a freq bin from a mix of (radial distance) +
+            // (per-dot offset). distance gives center-weighted structure;
+            // offset breaks perfect radial symmetry into organic spots.
+            if (freq && freq.length > 0) {
+              const binMix = dist * 0.55 + BIN_OFFSET[idx] * 0.45;
+              const binIdx = Math.min(freq.length - 1, Math.floor(binMix * freq.length * 0.7));
+              const v = freq[binIdx] / 255;
+              intensity = 0.06 + v * centerBoost * 1.1;
+            } else {
+              intensity = 0.05;
+            }
+          } else if (mode === "connecting") {
+            // ripple + per-dot phase = textured wave instead of clean ring
+            const ripple = Math.sin(phase * 1.5 - dist * 6 + PHASE[idx]) * 0.5 + 0.5;
+            intensity = 0.05 + ripple * centerBoost * 0.5;
+          } else {
+            // idle: per-dot phase makes the breathing shimmer rather than
+            // pulse in unison
+            const breathe = Math.sin(phase * 0.35 + PHASE[idx]) * 0.5 + 0.5;
+            intensity = 0.05 + breathe * centerBoost * 0.20;
+          }
+          intensity = Math.max(0, Math.min(1, intensity));
+
+          // soft glow on bright dots only — quadratic ramp so faintly lit
+          // dots stay sharp; the wave cluster gets the bloom that sells the
+          // "blending" look against the dark olive screen.
+          if (intensity > 0.4) {
+            const t = (intensity - 0.4) / 0.6;
+            ctx.shadowBlur = t * t * 14;
+          } else if (ctx.shadowBlur !== 0) {
+            ctx.shadowBlur = 0;
+          }
+
+          // single cream colour, opacity = intensity. dim dots fade into
+          // the dark olive bg; bright dots glow.
+          ctx.fillStyle = `rgba(${DOT_COLOR}, ${intensity.toFixed(3)})`;
+          ctx.fillRect(x * cellW + dotOffset, y * cellH + dotOffset, dotSize, dotSize);
+        }
+      }
+      ctx.shadowBlur = 0; // leave canvas state clean for next frame
+
+      requestAnimationFrame(render);
+    }
+    render();
+
+    // ── click pager to start/stop ────────────────────────────────────
+    pagerEl.addEventListener("click", async () => {
       if (conversation) {
         await conversation.endSession();
         return;
       }
 
-      button.disabled = true;
-      setStatus("requesting mic...");
+      setMode("connecting");
 
       try {
         await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (err) {
-        setStatus("mic denied");
-        button.disabled = false;
+      } catch {
+        setMode("error");
         return;
       }
 
-      setStatus("fetching signed url...");
       let signedUrl;
       try {
         const res = await fetch("/api/signed-url");
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         ({ signedUrl } = await res.json());
       } catch (err) {
-        setStatus("signed-url failed: " + err.message);
-        button.disabled = false;
+        console.error(err);
+        setMode("error");
         return;
       }
 
-      setStatus("connecting...");
       try {
         conversation = await Conversation.startSession({
           signedUrl,
@@ -103,8 +445,7 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ command }),
               });
-              const data = await r.json();
-              return JSON.stringify(data);
+              return JSON.stringify(await r.json());
             },
             claude_code: async ({ prompt }) => {
               console.log("[tool] claude_code", prompt);
@@ -113,8 +454,7 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ prompt }),
               });
-              const data = await r.json();
-              return JSON.stringify(data);
+              return JSON.stringify(await r.json());
             },
             cursor_agent: async ({ prompt }) => {
               console.log("[tool] cursor_agent", prompt);
@@ -123,37 +463,28 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ prompt }),
               });
-              const data = await r.json();
-              return JSON.stringify(data);
+              return JSON.stringify(await r.json());
             },
           },
-          onConnect: () => {
-            setStatus("listening");
-            button.textContent = "STOP";
-            button.disabled = false;
-          },
+          onConnect: () => setMode("listening"),
           onDisconnect: () => {
-            setStatus("disconnected");
-            button.textContent = "TALK";
-            button.disabled = false;
             conversation = null;
+            setMode("idle");
           },
           onError: (e) => {
             console.error("convai error", e);
-            setStatus("error: " + (e?.message ?? e));
+            setMode("error");
           },
-          onModeChange: ({ mode }) => {
-            // mode is "speaking" | "listening"
-            setStatus(mode);
-          },
+          onModeChange: ({ mode: m }) => setMode(m),
         });
       } catch (err) {
         console.error(err);
-        setStatus("connect failed: " + err.message);
-        button.disabled = false;
         conversation = null;
+        setMode("error");
       }
     });
+
+    setMode("idle");
   </script>
 </body>
 </html>
