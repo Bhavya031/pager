@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# pager — voice CLI agent dispatcher
+#
+# Two modes:
+#   pager                     Mode A (in tmux): pipe every current pane's output
+#                             to /tmp/pager-pane-*.log so the watcher sees errors
+#                             from any project running in any pane.
+#
+#   pager <cmd> [args...]     Mode B: run <cmd>, tee its output to a
+#                             /tmp/pager-cmd-*.log, watcher sees errors,
+#                             agent speaks. Exits with the command's exit code.
+#
+# Both modes ensure the local Pager server is running on :4520. Keep the
+# Pager tab open: voice starts on error (wake) or when you tap the device.
+
+set -euo pipefail
+
+# Resolve our own absolute path (handle symlinks so `ln -s … /usr/local/bin/pager` works).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *)  SOURCE="$(cd -P "$(dirname "$SOURCE")" && pwd)/$TARGET" ;;
+  esac
+done
+PAGER_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+SERVER_URL="http://localhost:4520"
+SERVER_LOG="/tmp/pager-server.log"
+SERVER_PID_FILE="/tmp/pager-server.pid"
+
+color_blue=$'\033[34m'
+color_dim=$'\033[2m'
+color_red=$'\033[31m'
+color_off=$'\033[0m'
+
+log()    { printf "%s[pager]%s %s\n" "$color_blue" "$color_off" "$*" >&2; }
+warn()   { printf "%s[pager]%s %s\n" "$color_red" "$color_off" "$*" >&2; }
+debug()  { printf "%s[pager] %s%s\n" "$color_dim" "$*" "$color_off" >&2; }
+
+# ── server bootstrap ───────────────────────────────────────────────────────
+
+server_alive() {
+  curl -fsS -o /dev/null --max-time 1 "${SERVER_URL}/" 2>/dev/null
+}
+
+ensure_server() {
+  if server_alive; then
+    debug "server already up at ${SERVER_URL}"
+    return 0
+  fi
+  log "starting server in background (logs: ${SERVER_LOG})"
+  ( cd "${PAGER_DIR}" && nohup bun run index.ts > "${SERVER_LOG}" 2>&1 < /dev/null & echo $! > "${SERVER_PID_FILE}" )
+  for _ in {1..30}; do
+    if server_alive; then
+      log "server ready on ${SERVER_URL}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  warn "server didn't come up in 6s — check ${SERVER_LOG}"
+  return 1
+}
+
+# ── mode A: tmux pane monitoring ───────────────────────────────────────────
+
+setup_tmux_pipes() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    warn "tmux not found (e.g. brew install tmux)."
+    exit 1
+  fi
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    warn "no tmux session. start one (tmux new -s dev) or use: pager <command>"
+    exit 1
+  fi
+  local count=0 pid clean log
+  while IFS= read -r pid; do
+    clean="${pid//%/}"
+    log="/tmp/pager-pane-${clean}.log"
+    tmux pipe-pane -t "$pid"
+    tmux pipe-pane -t "$pid" "cat >> ${log}"
+    debug "piping pane ${pid} → ${log}"
+    count=$((count + 1))
+  done < <(tmux list-panes -a -F "#{pane_id}")
+  log "${count} pane(s) → /tmp/pager-pane-*.log"
+}
+
+mode_tmux() {
+  if [ -z "${TMUX:-}" ]; then
+    warn "Mode A (no args) requires being inside a tmux session."
+    warn "either:  attach to tmux first, or  use:  pager <command>  to wrap a single command."
+    exit 1
+  fi
+  ensure_server
+  setup_tmux_pipes
+  log "monitoring tmux panes. keep ${SERVER_URL} open (wake on error or tap to talk)."
+  log "new panes? re-run \`pager\`."
+  hook_z="${PAGER_DIR}/hooks/pager-shell.zsh"
+  hook_b="${PAGER_DIR}/hooks/pager-shell.bash"
+  log "to log each shell command next to its output (required for tmux context), source a hook once:"
+  log "  zsh:  source '${hook_z}'"
+  log "  bash: source '${hook_b}'   (noisy; zsh hook is cleaner)"
+}
+
+# ── mode B: wrap a single command ──────────────────────────────────────────
+
+mode_wrap() {
+  ensure_server
+  local log_file="/tmp/pager-cmd-$$.log"
+  log "wrapping: $*"
+  debug "log: ${log_file}"
+  # Header lines the watcher reads as "preamble" → forwarded to the agent
+  # so it already knows what was running ("what were you doing?" answered).
+  local started
+  started="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")"
+  {
+    printf '[pager] cmd: %s\n' "$*"
+    printf '[pager] cwd: %s\n' "$PWD"
+    [ -n "${started}" ] && printf '[pager] started: %s\n' "${started}"
+  } > "${log_file}"
+  # tee appends to the header file. PIPESTATUS captures the real
+  # exit code of the wrapped command, not tee's.
+  set +e
+  "$@" 2>&1 | tee -a "${log_file}"
+  local exit_code=${PIPESTATUS[0]}
+  set -e
+  # explicitly mark non-zero exits so the watcher's regex catches it even
+  # if the command died silently without printing "Error:" anywhere.
+  if [ "${exit_code}" -ne 0 ]; then
+    printf "\n[pager] command FAILED with exit code %d\n" "${exit_code}" >> "${log_file}"
+  fi
+  exit "${exit_code}"
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+  mode_tmux
+else
+  mode_wrap "$@"
+fi
