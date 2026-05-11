@@ -145,8 +145,15 @@
     </div>
   </div>
 
+  <!-- Same-origin SDK (served by Bun from node_modules) — open this app only at http://localhost:4520 -->
+  <script src="/vendor/elevenlabs-client.js"></script>
   <script type="module">
-    import { Conversation } from "https://esm.sh/@elevenlabs/client@latest";
+    if (typeof ElevenLabsClient === "undefined" || !ElevenLabsClient.Conversation) {
+      document.getElementById("caption").textContent =
+        "Open http://localhost:4520 — run bun, not file://";
+      throw new Error("missing /vendor/elevenlabs-client.js");
+    }
+    const { Conversation } = ElevenLabsClient;
 
     const pagerEl = document.getElementById("pager");
     const canvas = document.getElementById("screen");
@@ -156,7 +163,118 @@
 
     let conversation = null;
     let mode = "idle"; // idle | connecting | listening | speaking | error
-    let vizMode = "wave"; // wave | cluster — toggleable from UI
+    let vizMode = "wave";
+    let alertSource = null;
+    let startSessionPromise = null;
+    // Alerts that arrive while no session is open. Flushed in onConnect.
+    const pendingAlerts = [];
+
+    const callTool = (name, key) => async (args) => {
+      const r = await fetch(`/api/${name}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: args[key] }),
+      });
+      return JSON.stringify(await r.json());
+    };
+    const clientTools = {
+      run_shell:    callTool("run_shell",    "command"),
+      claude_code:  callTool("claude_code",  "prompt"),
+      cursor_agent: callTool("cursor_agent", "prompt"),
+    };
+
+    function alertText(alerts) {
+      if (alerts.length === 1) {
+        return `[PAGER ALERT] ${alerts[0].paneId}\n${alerts[0].content}`;
+      }
+      const lines = alerts.map((a, i) => {
+        const ago = Math.max(1, Math.round((Date.now() - a.timestamp) / 1000));
+        const oneline = String(a.content).replace(/\s+/g, " ").slice(0, 220);
+        return `${i + 1}) ${a.paneId} (${ago}s ago): ${oneline}`;
+      });
+      return `[PAGER ALERT] ${alerts.length} unread events while you were away:\n${lines.join("\n")}`;
+    }
+
+    function flushPendingAlerts() {
+      if (!conversation || !pendingAlerts.length) return;
+      try {
+        conversation.sendUserMessage(alertText(pendingAlerts));
+        pendingAlerts.length = 0;
+      } catch (err) {
+        console.error("flush alerts", err);
+      }
+    }
+
+    async function openVoiceSession() {
+      setMode("connecting");
+      try {
+        const res = await fetch("/api/signed-url");
+        if (!res.ok) throw new Error(`signed-url HTTP ${res.status}`);
+        const { signedUrl } = await res.json();
+        conversation = await Conversation.startSession({
+          signedUrl,
+          libsampleratePath: new URL("/vendor/libsamplerate.worklet.js", location.origin).href,
+          clientTools,
+          onConnect: () => {
+            setMode("listening");
+            // Cut off the server-side afplay announcement so it doesn't
+            // overlap with the agent's voice.
+            fetch("/api/tts-stop", { method: "POST" }).catch(() => {});
+            // Will no-op if `conversation` hasn't been assigned yet — the
+            // post-await flush below handles that race.
+            flushPendingAlerts();
+          },
+          onDisconnect: () => {
+            conversation = null;
+            setMode("idle");
+          },
+          onError: (e) => {
+            console.error("convai error", e);
+            setMode("error");
+          },
+          onModeChange: ({ mode: m }) => setMode(m),
+        });
+        // SDK can fire onConnect before the await resolves and assigns
+        // `conversation`, so onConnect's flush sees null and bails. Run it
+        // again now that the assignment is guaranteed.
+        flushPendingAlerts();
+      } catch (err) {
+        console.error("openVoiceSession", err);
+        conversation = null;
+        setMode("error");
+        throw err;
+      }
+    }
+
+    async function ensureVoiceSession() {
+      if (conversation) return;
+      if (startSessionPromise) return startSessionPromise;
+      startSessionPromise = openVoiceSession().finally(() => {
+        startSessionPromise = null;
+      });
+      return startSessionPromise;
+    }
+
+    function subscribeToAlerts() {
+      if (alertSource) return;
+      alertSource = new EventSource(new URL("/api/alerts", location.origin));
+      alertSource.onmessage = (e) => {
+        let alert;
+        try { alert = JSON.parse(e.data); } catch { return; }
+        if (!alert?.content || !alert?.id) return;
+        if (conversation && typeof conversation.sendUserMessage === "function") {
+          try {
+            conversation.sendUserMessage(`[PAGER ALERT] ${alert.paneId}\n${alert.content}`);
+          } catch (err) {
+            console.error("live alert send", err);
+          }
+          return;
+        }
+        pendingAlerts.push(alert);
+        ensureVoiceSession().catch((err) => console.error("wake session", err));
+      };
+      alertSource.onerror = () => console.warn("[alert] SSE error");
+    }
 
     function setVizMode(next) {
       vizMode = next;
@@ -169,7 +287,7 @@
     });
 
     const COPY = {
-      idle:       "Tap to talk",
+      idle:       "Tap to talk · wakes on error",
       connecting: "Connecting…",
       listening:  "Listening",
       speaking:   "Speaking",
@@ -407,83 +525,20 @@
     }
     render();
 
-    // ── click pager to start/stop ────────────────────────────────────
     pagerEl.addEventListener("click", async () => {
       if (conversation) {
         await conversation.endSession();
         return;
       }
-
-      setMode("connecting");
-
       try {
-        await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {
-        setMode("error");
-        return;
-      }
-
-      let signedUrl;
-      try {
-        const res = await fetch("/api/signed-url");
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        ({ signedUrl } = await res.json());
+        await openVoiceSession();
       } catch (err) {
         console.error(err);
-        setMode("error");
-        return;
-      }
-
-      try {
-        conversation = await Conversation.startSession({
-          signedUrl,
-          clientTools: {
-            run_shell: async ({ command }) => {
-              console.log("[tool] run_shell", command);
-              const r = await fetch("/api/run_shell", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ command }),
-              });
-              return JSON.stringify(await r.json());
-            },
-            claude_code: async ({ prompt }) => {
-              console.log("[tool] claude_code", prompt);
-              const r = await fetch("/api/claude_code", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt }),
-              });
-              return JSON.stringify(await r.json());
-            },
-            cursor_agent: async ({ prompt }) => {
-              console.log("[tool] cursor_agent", prompt);
-              const r = await fetch("/api/cursor_agent", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt }),
-              });
-              return JSON.stringify(await r.json());
-            },
-          },
-          onConnect: () => setMode("listening"),
-          onDisconnect: () => {
-            conversation = null;
-            setMode("idle");
-          },
-          onError: (e) => {
-            console.error("convai error", e);
-            setMode("error");
-          },
-          onModeChange: ({ mode: m }) => setMode(m),
-        });
-      } catch (err) {
-        console.error(err);
-        conversation = null;
-        setMode("error");
+        if (mode !== "error") setMode("idle");
       }
     });
 
+    subscribeToAlerts();
     setMode("idle");
   </script>
 </body>
