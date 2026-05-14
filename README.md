@@ -1,5 +1,9 @@
 # Pager
 
+<p align="center">
+  <img src="public/poster.png" alt="Pager — a voice that watches your code while you don't." width="100%" />
+</p>
+
 ***Pager has your back.***
 
 A voice agent that lives on your machine. It watches your dev environment and speaks up when something breaks — so you can keep gaming, cooking, parenting, or driving, and still ship.
@@ -9,6 +13,16 @@ Your terminal errors → Pager notices → Pager speaks → you reply hands-free
 Built for [ElevenHacks](https://elevenlabs.io/) — Cursor + ElevenLabs hackathon, May 2026.
 
 **Stack:** Bun, TypeScript, ElevenLabs Conversational AI, Cursor Agent CLI, Claude Code subprocess.
+
+## Powered by
+
+<p>
+  <img src="public/elevenlabs.png" alt="ElevenLabs" height="24" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="public/cursor-lockup.png" alt="Cursor" height="30" />
+</p>
+
+Pager is built on our sponsors' AI. **ElevenLabs** Conversational AI is the voice — it hears you and speaks back, hands-free. **Cursor**'s `cursor-agent` is the fixer — it reads your code and ships the patch. Pager's landing page and poster also borrow **Cursor**'s visual styling — their CLI page layout and brand language — adapted to our own cream-and-amber identity.
 
 ## How it works
 
@@ -25,7 +39,7 @@ Every `cursor_agent` call runs on a throwaway branch. Smallest possible change. 
 Install with one command (clones to `~/.pager`, installs deps, puts `pager` on your PATH):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bhavya031/pager/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Bhavya031/pager/refs/heads/main/install.sh | bash
 ```
 
 Then fill in your ElevenLabs keys in `~/.pager/.env` and you're ready.
