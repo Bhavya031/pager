@@ -1,6 +1,40 @@
 import { watch } from "node:fs";
 import { readdir } from "node:fs/promises";
 
+// ─── colored console ──────────────────────────────────────────────────────
+// Wraps console.{log,warn,error} so a leading [tag] gets a color — makes the
+// `bun run dev` stream scannable at a glance. Untagged warn/error lines get
+// tinted whole so failures still stand out.
+const RESET = "\x1b[0m";
+const TAG_COLORS: Record<string, string> = {
+  watcher:      "\x1b[36m",       // cyan
+  alert:        "\x1b[1;91m",     // bold bright red
+  "alert:test": "\x1b[1;91m",     // bold bright red
+  tts:          "\x1b[35m",       // magenta
+  sse:          "\x1b[34m",       // blue
+  browser:      "\x1b[33m",       // yellow
+  run_shell:    "\x1b[38;5;214m", // orange
+  claude_code:  "\x1b[38;5;208m", // deep orange
+  cursor_agent: "\x1b[38;5;141m", // purple
+  pager:        "\x1b[90m",       // gray
+};
+const TAG_RE = /^(\s*)\[([\w:]+)\]/;
+function paintTag(s: string): string | null {
+  const m = TAG_RE.exec(s);
+  if (!m) return null;
+  const color = TAG_COLORS[m[2]!];
+  return color ? s.replace(TAG_RE, `$1${color}[${m[2]}]${RESET}`) : null;
+}
+const rawLog = console.log.bind(console);
+const rawWarn = console.warn.bind(console);
+const rawErr = console.error.bind(console);
+console.log = (...a: unknown[]) =>
+  rawLog(...a.map((x) => (typeof x === "string" ? (paintTag(x) ?? x) : x)));
+console.warn = (...a: unknown[]) =>
+  rawWarn(...a.map((x) => (typeof x === "string" ? (paintTag(x) ?? `\x1b[33m${x}${RESET}`) : x)));
+console.error = (...a: unknown[]) =>
+  rawErr(...a.map((x) => (typeof x === "string" ? (paintTag(x) ?? `\x1b[31m${x}${RESET}`) : x)));
+
 const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 const API_KEY = process.env.ELEVENLABS_API_KEY;
 
@@ -19,6 +53,15 @@ const REPO_DIR = import.meta.dir;
 const TOOL_TIMEOUT_MS = 30_000;
 const AGENT_TIMEOUT_MS = 60_000;
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "tnSpp4vdxKPjI9w0GnoV";
+
+// User-facing shell — used so the agent can propose commands in the right
+// dialect (e.g. nushell rejects `&&` chains). Override with PAGER_USER_SHELL
+// since $SHELL reports the LOGIN shell, not what the user is actually typing
+// into (a tmux pane might exec nu while $SHELL stays /bin/zsh).
+const USER_SHELL =
+  (process.env.PAGER_USER_SHELL || process.env.SHELL || "unknown")
+    .split("/")
+    .pop() || "unknown";
 
 async function getSignedUrl(): Promise<string> {
   const res = await fetch(
@@ -41,11 +84,23 @@ type Alert = { id: string; paneId: string; content: string; timestamp: number };
 const LOG_DIR = "/tmp";
 const LOG_FILENAME_RE = /^pager-(pane|cmd)-([\w%]+)\.log$/;
 const ERROR_RE =
-  /\b(Error|Exception|FAIL(?:URE|ED)?|panic|TypeError|SyntaxError|ReferenceError|RangeError)[:!]|\b(Segmentation fault|cannot find|command not found|core dumped)\b|✗|✘/i;
+  /\b\w*(?:Error|Exception)[:!]|\b(?:FAIL(?:URE|ED)?|panic|Traceback|Segmentation fault|cannot find|command not found|core dumped)\b|\berror TS\d+\b|\berror\[[A-Z]\d+\]|✗|✘/i;
 // Lines pager itself emits — must be filtered out before error-matching so
 // pager doesn't alert on its own output when it's running inside a monitored
 // tmux pane (e.g. "[alert] pane 1: TypeError…" would recursively trigger).
 const PAGER_LOG_LINE_RE = /^\[(alert|tts|sse|watcher|browser|startup|pager|run_shell|claude_code|cursor_agent)/;
+// tmux pipe-pane captures the raw terminal stream including colour codes and
+// starship prompt redraws — without stripping, "error TS2741:" can become
+// "error\e[0m \e[90mTS2741:" and ERROR_RE misses.
+const ANSI_RE =
+  /\x1B\[[?!\d;]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1B[()][AB012]|\x1B[@-Z\\-_]|[\x00-\x08\x0B-\x1F\x7F]/g;
+function cleanLog(s: string): string {
+  return s
+    .replace(ANSI_RE, "")
+    .split("\n")
+    .filter((l) => !PAGER_LOG_LINE_RE.test(l))
+    .join("\n");
+}
 const ALERT_COOLDOWN_MS = 5_000;
 const ALERT_CONTENT_MAX = 1_500;       // body output cap; agent can fetch more via run_shell tail
 const PREAMBLE_MAX = 400;              // bytes to read at file head (Mode B preamble)
@@ -167,13 +222,7 @@ async function buildAlertBody(path: string, source: string): Promise<AlertContex
   // cwd. Skips silently if cwd is unknown or not a git repo.
   const gitInfo = cwdPath ? await gitContext(cwdPath) : null;
 
-  // Strip pager's own log lines from the visible body so the agent doesn't
-  // see pager's internal chatter as part of the user's error context.
-  const outputBody = tail
-    .split("\n")
-    .filter((l) => !PAGER_LOG_LINE_RE.test(l))
-    .join("\n")
-    .trim();
+  const outputBody = cleanLog(tail).trim();
   const truncated =
     outputBody.length > ALERT_CONTENT_MAX
       ? "…" + outputBody.slice(-ALERT_CONTENT_MAX)
@@ -183,6 +232,7 @@ async function buildAlertBody(path: string, source: string): Promise<AlertContex
   if (current) sections.push(current);
   if (cwdPath) sections.push(`[pager] cwd: ${cwdPath}`);
   sections.push(`[pager] log: ${path}`);
+  sections.push(`[env] shell: ${USER_SHELL}, platform: ${process.platform}`);
   if (previous.length) {
     sections.push(`[previous commands:]\n${previous.map((c) => "  " + c).join("\n")}`);
   }
@@ -266,14 +316,7 @@ async function processLog(path: string, source: string, id: string): Promise<voi
   const isFresh = source === "cmd";
   const newContent = await tailFile(path, isFresh);
   if (!newContent) return;
-  // Strip pager's own log lines before deciding whether this is an alert-
-  // worthy error — otherwise pager monitoring a pane it's running in
-  // recursively alerts on its own output.
-  const userContent = newContent
-    .split("\n")
-    .filter((l) => !PAGER_LOG_LINE_RE.test(l))
-    .join("\n");
-  if (!ERROR_RE.test(userContent)) return;
+  if (!ERROR_RE.test(cleanLog(newContent))) return;
 
   const key = `${source}:${id}`;
   const now = Date.now();
@@ -345,14 +388,16 @@ setInterval(async () => {
     const files = await readdir(LOG_DIR);
     const validPaths = new Set<string>();
     const validKeys = new Set<string>();
+    const tasks: Promise<void>[] = [];
     for (const f of files) {
       const m = LOG_FILENAME_RE.exec(f);
       if (!m || !m[1] || !m[2]) continue;
       const path = `${LOG_DIR}/${f}`;
       validPaths.add(path);
       validKeys.add(`${m[1]}:${m[2]}`);
-      await processLog(path, m[1], m[2]);
+      tasks.push(processLog(path, m[1], m[2]));
     }
+    await Promise.all(tasks);
     // Drop entries for logs that have been deleted so the maps don't grow forever.
     for (const path of fileOffsets.keys()) if (!validPaths.has(path)) fileOffsets.delete(path);
     for (const key of lastAlertAt.keys()) if (!validKeys.has(key)) lastAlertAt.delete(key);
@@ -445,6 +490,16 @@ const SHELL_DENY_PATTERNS: { re: RegExp; reason: string }[] = [
   { re: /\b(?:shutdown|reboot|halt|poweroff)\b/i,     reason: "system power command blocked" },
   { re: /\bchmod\s+(?:0?777|a\+rwx)\b/i,              reason: "chmod 777 blocked" },
   { re: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,   reason: "fork bomb blocked" },
+  // Credential-bearing files — agent has no business reading these even
+  // for diagnosis. Covers both ~/path and absolute /Users/.../path forms.
+  { re: /\.docker\/config\.json\b/,                   reason: "docker config (auth tokens) blocked" },
+  { re: /(?:^|[\s/])\.npmrc\b/,                       reason: ".npmrc (auth tokens) blocked" },
+  { re: /(?:^|[\s/])\.netrc\b/,                       reason: ".netrc (credentials) blocked" },
+  { re: /\.ssh\/(?:id_[a-z]+|known_hosts)\b/,         reason: "ssh keys/known_hosts blocked" },
+  { re: /\.aws\/credentials\b/,                       reason: "aws credentials blocked" },
+  { re: /\.config\/gh\/hosts\.yml\b/,                 reason: "gh auth file blocked" },
+  { re: /\bgh\s+auth\s+token\b/,                      reason: "gh auth token blocked" },
+  { re: /(?:^|[\s/])\.pypirc\b/,                      reason: ".pypirc blocked" },
 ];
 function checkShellSafety(cmd: string): { ok: true } | { ok: false; reason: string } {
   for (const { re, reason } of SHELL_DENY_PATTERNS) {
@@ -608,8 +663,8 @@ Bun.serve({
   },
 });
 
-console.log(`Pager listening on http://localhost:${PORT}`);
-console.log(`  cwd for tools: ${REPO_DIR}`);
+console.log(`\x1b[1;32mPager listening on http://localhost:${PORT}\x1b[0m`);
+console.log(`\x1b[90m  cwd for tools: ${REPO_DIR}\x1b[0m`);
 
 // Browser only opens on demand (when an alert fires with no connected tab).
 // User doesn't need to keep the tab open all the time.
